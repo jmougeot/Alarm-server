@@ -1,16 +1,4 @@
-Parfait — voici **LE PLAN DE BASE DE DONNÉES COMPLET DIRECTEMENT AU NIVEAU “ÉTAPE 4”**,
-c’est-à-dire **pages partagées, groupes, droits, temps réel**, prêt pour SQLite / Postgres.
-
-Je te le donne :
-
-* **structuré**
-* **cohérent**
-* **sans étape intermédiaire**
-* **directement implémentable**
-
----
-
-# 🧱 PLAN GLOBAL DE LA DB (ÉTAPE 4)
+#  PLAN GLOBAL DE LA DB
 
 ```
 users
@@ -24,7 +12,7 @@ alarms
 alarm_events
 ```
 
-👉 **Principe clé** :
+ **Principe clé** :
 
 * les **pages portent les permissions**
 * les **alarmes héritent des pages**
@@ -32,7 +20,7 @@ alarm_events
 
 ---
 
-# 👤 1️⃣ `users`
+# `users`
 
 ```sql
 users (
@@ -48,7 +36,7 @@ users (
 
 ---
 
-# 👥 2️⃣ `groups`
+# `groups`
 
 ```sql
 groups (
@@ -61,7 +49,7 @@ groups (
 
 ---
 
-# 🔗 3️⃣ `user_groups`
+# `user_groups`
 
 ```sql
 user_groups (
@@ -78,7 +66,7 @@ user_groups (
 
 ---
 
-# 📄 4️⃣ `pages`  **(UNITÉ CENTRALE)**
+# `pages`  **(UNITÉ CENTRALE)**
 
 ```sql
 pages (
@@ -99,7 +87,7 @@ pages (
 
 ---
 
-# 🔐 5️⃣ `page_permissions`  **(TABLE CLÉ)**
+# `page_permissions`  **(TABLE CLÉ)**
 
 ```sql
 page_permissions (
@@ -118,11 +106,11 @@ page_permissions (
 🔹 Définit **QUI voit / édite la page**
 🔹 `subject_id` → `users.id` OU `groups.id`
 
-👉 **Si tu as accès à la page, tu as accès à TOUTES ses alarmes**
+**Si tu as accès à la page, tu as accès à TOUTES ses alarmes**
 
 ---
 
-# 🔔 6️⃣ `alarms`
+# `alarms`
 
 ```sql
 alarms (
@@ -152,7 +140,7 @@ alarms (
 
 ---
 
-# 📜 7️⃣ `alarm_events` (historique / audit)
+# `alarm_events` (historique / audit)
 
 ```sql
 alarm_events (
@@ -168,39 +156,7 @@ alarm_events (
 )
 ```
 
-🔹 Permet :
-
-* historique
-* debug
-* audit
-* analytics
-
----
-
-# 🧠 RÈGLES STRUCTURELLES (IMPORTANTES)
-
-### 1️⃣ Une alarme ∈ une page
-
-❌ jamais plusieurs pages
-❌ jamais sans page
-
----
-
-### 2️⃣ Les permissions sont UNIQUEMENT sur les pages
-
-❌ pas sur les alarmes
-❌ pas dans le code
-
----
-
-### 3️⃣ Le serveur filtre TOUT
-
-❌ pas de filtrage client
-❌ pas de “cache permissif”
-
----
-
-# 🔄 TEMPS RÉEL : LIEN DB ↔ WEBSOCKET
+# TEMPS RÉEL : LIEN DB ↔ WEBSOCKET
 
 ### À la connexion WS
 
@@ -220,7 +176,7 @@ alarm_events (
 
 ---
 
-# 🧭 REQUÊTES CLÉS (conceptuelles)
+#  REQUÊTES CLÉS (conceptuelles)
 
 ### Pages visibles par un user
 
@@ -245,18 +201,3 @@ WHERE page_id IN (:page_ids)
 ```
 
 ---
-
-# 🧠 RÉSUMÉ EN UNE PHRASE
-
-> **La page est l’unité de sécurité, de partage et de temps réel.**
-
----
-
-Si tu veux, je peux :
-
-* te donner le **script SQL complet**
-* écrire les **requêtes exactes async**
-* t’aider à implémenter le **broadcast WS ciblé**
-* valider le modèle côté UI Qt
-
-Dis-moi 👍

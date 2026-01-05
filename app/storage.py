@@ -110,6 +110,8 @@ async def init_db():
                 ticker TEXT NOT NULL,
                 option TEXT NOT NULL,
                 condition TEXT NOT NULL,
+                strategy_id TEXT,
+                strategy_name TEXT,
                 created_by TEXT NOT NULL,
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at DATETIME NOT NULL,
@@ -159,7 +161,7 @@ async def create_user(user: UserCreate, password_hash: str) -> User:
     return User(id=user_id, username=user.username, created_at=created_at)
 
 
-async def get_user_by_username(username: str) -> Optional[tuple]:
+async def get_user_by_username(username: str) -> Optional[dict]:
     """Récupère un user par son username (avec hash pour auth)"""
     async with get_db() as db:
         cursor = await db.execute(
@@ -231,15 +233,27 @@ async def get_user_groups(user_id: str) -> List[str]:
 # ─────────────────────────────────────────────────────────────
 
 async def create_page(page: PageCreate, owner_id: str) -> Page:
-    """Crée une nouvelle page"""
+    """Crée une nouvelle page et donne automatiquement les permissions au créateur"""
     page_id = str(uuid.uuid4())
     created_at = datetime.utcnow()
     
     async with get_db() as db:
+        # Créer la page
         await db.execute(
             "INSERT INTO pages (id, name, owner_id, created_at) VALUES (?, ?, ?, ?)",
             (page_id, page.name, owner_id, created_at)
         )
+        
+        # Créer une permission explicite pour le owner (can_view=1, can_edit=1)
+        await db.execute(
+            """
+            INSERT INTO page_permissions 
+            (page_id, subject_type, subject_id, can_view, can_edit)
+            VALUES (?, 'user', ?, 1, 1)
+            """,
+            (page_id, owner_id)
+        )
+        
         await db.commit()
     
     return Page(id=page_id, name=page.name, owner_id=owner_id, created_at=created_at)
@@ -454,8 +468,8 @@ async def create_alarm(alarm: AlarmCreate, created_by: str) -> Alarm:
         await db.execute(
             """
             INSERT INTO alarms 
-            (id, page_id, ticker, option, condition, created_by, active, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+            (id, page_id, ticker, option, condition, strategy_id, strategy_name, created_by, active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             """,
             (
                 alarm_id,
@@ -463,6 +477,8 @@ async def create_alarm(alarm: AlarmCreate, created_by: str) -> Alarm:
                 alarm.ticker,
                 alarm.option,
                 alarm.condition.value,
+                alarm.strategy_id,
+                alarm.strategy_name,
                 created_by,
                 created_at
             )
@@ -475,6 +491,8 @@ async def create_alarm(alarm: AlarmCreate, created_by: str) -> Alarm:
         ticker=alarm.ticker,
         option=alarm.option,
         condition=alarm.condition,
+        strategy_id=alarm.strategy_id,
+        strategy_name=alarm.strategy_name,
         created_by=created_by,
         active=True,
         created_at=created_at,
@@ -487,8 +505,8 @@ async def get_alarm_by_id(alarm_id: str) -> Optional[Alarm]:
     async with get_db() as db:
         cursor = await db.execute(
             """
-            SELECT id, page_id, ticker, option, condition, created_by, 
-                   active, created_at, last_triggered
+            SELECT id, page_id, ticker, option, condition, strategy_id, strategy_name,
+                   created_by, active, created_at, last_triggered
             FROM alarms WHERE id = ?
             """,
             (alarm_id,)
@@ -501,6 +519,40 @@ async def get_alarm_by_id(alarm_id: str) -> Optional[Alarm]:
                 ticker=row["ticker"],
                 option=row["option"],
                 condition=row["condition"],
+                strategy_id=row["strategy_id"],
+                strategy_name=row["strategy_name"],
+                created_by=row["created_by"],
+                active=bool(row["active"]),
+                created_at=row["created_at"],
+                last_triggered=row["last_triggered"]
+            )
+        return None
+
+
+async def get_alarm_by_strategy_id(strategy_id: str, page_id: str) -> Optional[Alarm]:
+    """Récupère une alarme par son strategy_id sur une page donnée"""
+    if not strategy_id:
+        return None
+    
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT id, page_id, ticker, option, condition, strategy_id, strategy_name,
+                   created_by, active, created_at, last_triggered
+            FROM alarms WHERE strategy_id = ? AND page_id = ?
+            """,
+            (strategy_id, page_id)
+        )
+        row = await cursor.fetchone()
+        if row:
+            return Alarm(
+                id=row["id"],
+                page_id=row["page_id"],
+                ticker=row["ticker"],
+                option=row["option"],
+                condition=row["condition"],
+                strategy_id=row["strategy_id"],
+                strategy_name=row["strategy_name"],
                 created_by=row["created_by"],
                 active=bool(row["active"]),
                 created_at=row["created_at"],
@@ -518,8 +570,8 @@ async def get_alarms_for_pages(page_ids: List[str]) -> List[Alarm]:
         placeholders = ",".join("?" * len(page_ids))
         cursor = await db.execute(
             f"""
-            SELECT id, page_id, ticker, option, condition, created_by,
-                   active, created_at, last_triggered
+            SELECT id, page_id, ticker, option, condition, strategy_id, strategy_name,
+                   created_by, active, created_at, last_triggered
             FROM alarms
             WHERE page_id IN ({placeholders})
             """,
@@ -534,6 +586,8 @@ async def get_alarms_for_pages(page_ids: List[str]) -> List[Alarm]:
                 ticker=row["ticker"],
                 option=row["option"],
                 condition=row["condition"],
+                strategy_id=row["strategy_id"],
+                strategy_name=row["strategy_name"],
                 created_by=row["created_by"],
                 active=bool(row["active"]),
                 created_at=row["created_at"],
@@ -545,7 +599,7 @@ async def get_alarms_for_pages(page_ids: List[str]) -> List[Alarm]:
 
 async def update_alarm(alarm_id: str, **kwargs) -> Optional[Alarm]:
     """Met à jour une alarme"""
-    allowed_fields = {"ticker", "option", "condition", "active"}
+    allowed_fields = {"ticker", "option", "condition", "active", "strategy_id", "strategy_name"}
     updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
     
     if not updates:
@@ -641,3 +695,138 @@ async def get_alarm_events(alarm_id: str, limit: int = 100) -> List[AlarmEvent]:
             )
             for row in rows
         ]
+
+
+# ─────────────────────────────────────────────────────────────
+# GROUPS — FONCTIONS SUPPLÉMENTAIRES
+# ─────────────────────────────────────────────────────────────
+
+async def get_group_by_id(group_id: str) -> Optional[Group]:
+    """Récupère un groupe par son ID"""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT id, name FROM groups WHERE id = ?",
+            (group_id,)
+        )
+        row = await cursor.fetchone()
+        if row:
+            return Group(id=row["id"], name=row["name"])
+        return None
+
+
+async def get_group_by_name(name: str) -> Optional[Group]:
+    """Récupère un groupe par son nom"""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT id, name FROM groups WHERE name = ?",
+            (name,)
+        )
+        row = await cursor.fetchone()
+        if row:
+            return Group(id=row["id"], name=row["name"])
+        return None
+
+
+async def get_user_groups_full(user_id: str) -> List[Group]:
+    """Récupère les groupes d'un utilisateur (objets complets)"""
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT g.id, g.name
+            FROM groups g
+            JOIN user_groups ug ON g.id = ug.group_id
+            WHERE ug.user_id = ?
+            """,
+            (user_id,)
+        )
+        rows = await cursor.fetchall()
+        return [Group(id=row["id"], name=row["name"]) for row in rows]
+
+
+async def get_group_members(group_id: str) -> List[User]:
+    """Liste les membres d'un groupe"""
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT u.id, u.username, u.created_at
+            FROM users u
+            JOIN user_groups ug ON u.id = ug.user_id
+            WHERE ug.group_id = ?
+            """,
+            (group_id,)
+        )
+        rows = await cursor.fetchall()
+        return [
+            User(id=row["id"], username=row["username"], created_at=row["created_at"])
+            for row in rows
+        ]
+
+
+async def is_user_in_group(user_id: str, group_id: str) -> bool:
+    """Vérifie si un utilisateur est dans un groupe"""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM user_groups WHERE user_id = ? AND group_id = ?",
+            (user_id, group_id)
+        )
+        return await cursor.fetchone() is not None
+
+
+async def remove_user_from_group(user_id: str, group_id: str) -> bool:
+    """Retire un utilisateur d'un groupe"""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "DELETE FROM user_groups WHERE user_id = ? AND group_id = ?",
+            (user_id, group_id)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def delete_group(group_id: str) -> bool:
+    """Supprime un groupe"""
+    async with get_db() as db:
+        await db.execute("DELETE FROM user_groups WHERE group_id = ?", (group_id,))
+        await db.execute("DELETE FROM page_permissions WHERE subject_type = 'group' AND subject_id = ?", (group_id,))
+        cursor = await db.execute("DELETE FROM groups WHERE id = ?", (group_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+# ─────────────────────────────────────────────────────────────
+# PAGE PERMISSIONS — FONCTIONS SUPPLÉMENTAIRES
+# ─────────────────────────────────────────────────────────────
+
+async def get_page_permissions_list(page_id: str) -> List[dict]:
+    """Liste les permissions d'une page"""
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT page_id, subject_type, subject_id, can_view, can_edit
+            FROM page_permissions
+            WHERE page_id = ?
+            """,
+            (page_id,)
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "page_id": row["page_id"],
+                "subject_type": row["subject_type"],
+                "subject_id": row["subject_id"],
+                "can_view": bool(row["can_view"]),
+                "can_edit": bool(row["can_edit"])
+            }
+            for row in rows
+        ]
+
+
+async def remove_page_permission(page_id: str, subject_type: str, subject_id: str) -> bool:
+    """Retire une permission d'une page"""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "DELETE FROM page_permissions WHERE page_id = ? AND subject_type = ? AND subject_id = ?",
+            (page_id, subject_type, subject_id)
+        )
+        await db.commit()
+        return cursor.rowcount > 0

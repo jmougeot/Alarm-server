@@ -11,7 +11,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPExcept
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 
-from .models import User, UserCreate, Token, GroupCreate, PageCreate
+from .models import User, UserCreate, Token, GroupCreate, PageCreate, PagePermissionCreate, PagePermissionRequest
 from . import storage, auth
 from .ws import manager, handle_message
 
@@ -114,7 +114,16 @@ async def create_group(
     current_user: User = Depends(auth.get_current_user)
 ):
     """Crée un nouveau groupe"""
+    # Vérifier si le groupe existe déjà
+    existing = await storage.get_group_by_name(group_data.name)
+    if existing:
+        raise HTTPException(status_code=400, detail="Group name already exists")
+    
     group = await storage.create_group(group_data)
+    
+    # Ajouter automatiquement le créateur comme membre
+    await storage.add_user_to_group(current_user.id, group.id)
+    
     return {"id": group.id, "name": group.name}
 
 
@@ -129,6 +138,103 @@ async def add_member_to_group(
     if not success:
         raise HTTPException(status_code=400, detail="Could not add user to group")
     return {"status": "added"}
+
+
+@app.get("/users/search")
+async def search_user(
+    username: str,
+    current_user: User = Depends(auth.get_current_user)
+):
+    """Recherche un utilisateur par nom"""
+    user_data = await storage.get_user_by_username(username)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {
+        "id": user_data["id"],
+        "username": user_data["username"]
+    }
+
+
+@app.get("/groups/search")
+async def search_group(
+    name: str,
+    current_user: User = Depends(auth.get_current_user)
+):
+    """Recherche un groupe par nom"""
+    group = await storage.get_group_by_name(name)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    return {
+        "id": group.id,
+        "name": group.name
+    }
+
+
+@app.get("/groups/{group_id}")
+async def get_group(
+    group_id: str,
+    current_user: User = Depends(auth.get_current_user)
+):
+    """Obtient les détails d'un groupe"""
+    group = await storage.get_group_by_id(group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Vérifier que l'utilisateur est membre
+    is_member = await storage.is_user_in_group(current_user.id, group_id)
+    if not is_member:
+        raise HTTPException(status_code=403, detail="Not a member of this group")
+    
+    members = await storage.get_group_members(group_id)
+    
+    return {
+        "id": group.id,
+        "name": group.name,
+        "members": [{"id": m.id, "username": m.username} for m in members]
+    }
+
+
+@app.get("/groups")
+async def list_my_groups(
+    current_user: User = Depends(auth.get_current_user)
+):
+    """Liste les groupes de l'utilisateur"""
+    groups = await storage.get_user_groups_full(current_user.id)
+    return [{"id": g.id, "name": g.name} for g in groups]
+
+
+@app.delete("/groups/{group_id}")
+async def delete_group(
+    group_id: str,
+    current_user: User = Depends(auth.get_current_user)
+):
+    """Supprime un groupe (créateur seulement - simplifié ici)"""
+    group = await storage.get_group_by_id(group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    await storage.delete_group(group_id)
+    return {"status": "deleted"}
+
+
+@app.delete("/groups/{group_id}/members/{user_id}")
+async def remove_group_member(
+    group_id: str,
+    user_id: str,
+    current_user: User = Depends(auth.get_current_user)
+):
+    """Retire un membre d'un groupe"""
+    group = await storage.get_group_by_id(group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    success = await storage.remove_user_from_group(user_id, group_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="Could not remove user from group")
+    
+    return {"status": "removed"}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -164,12 +270,107 @@ async def list_pages(current_user: User = Depends(auth.get_current_user)):
     ]
 
 
+@app.get("/pages/{page_id}/permissions")
+async def get_page_permissions(
+    page_id: str,
+    current_user: User = Depends(auth.get_current_user)
+):
+    """Liste les permissions d'une page"""
+    page = await storage.get_page_by_id(page_id)
+    if not page:
+        raise HTTPException(status_code=404, detail="Page not found")
+    
+    # Vérifier que l'utilisateur a accès
+    can_view = await storage.can_user_view_page(current_user.id, page_id)
+    if not can_view:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    permissions = await storage.get_page_permissions_list(page_id)
+    
+    # Enrichir avec les noms
+    result = []
+    for perm in permissions:
+        if perm["subject_type"] == "user":
+            user = await storage.get_user_by_id(perm["subject_id"])
+            subject_name = user.username if user else "Unknown"
+        else:
+            group = await storage.get_group_by_id(perm["subject_id"])
+            subject_name = group.name if group else "Unknown"
+        
+        result.append({
+            "subject_type": perm["subject_type"],
+            "subject_id": perm["subject_id"],
+            "subject_name": subject_name,
+            "can_view": perm["can_view"],
+            "can_edit": perm["can_edit"]
+        })
+    
+    return result
+
+
+@app.post("/pages/{page_id}/permissions")
+async def add_page_permission(
+    page_id: str,
+    permission_data: PagePermissionRequest,
+    current_user: User = Depends(auth.get_current_user)
+):
+    """Ajoute ou modifie une permission sur une page"""
+    page = await storage.get_page_by_id(page_id)
+    if not page:
+        raise HTTPException(status_code=404, detail="Page not found")
+    
+    # Seul l'owner peut gérer les permissions
+    if page.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only owner can manage permissions")
+    
+    # Créer le PagePermissionCreate avec le page_id de l'URL
+    perm_create = PagePermissionCreate(
+        page_id=page_id,
+        subject_type=permission_data.subject_type,
+        subject_id=permission_data.subject_id,
+        can_view=permission_data.can_view,
+        can_edit=permission_data.can_edit
+    )
+    
+    permission = await storage.set_page_permission(perm_create)
+    
+    return {
+        "subject_type": permission.subject_type.value,
+        "subject_id": permission.subject_id,
+        "can_view": permission.can_view,
+        "can_edit": permission.can_edit
+    }
+
+
+@app.delete("/pages/{page_id}/permissions")
+async def remove_page_permission(
+    page_id: str,
+    subject_type: str,
+    subject_id: str,
+    current_user: User = Depends(auth.get_current_user)
+):
+    """Retire une permission d'une page"""
+    page = await storage.get_page_by_id(page_id)
+    if not page:
+        raise HTTPException(status_code=404, detail="Page not found")
+    
+    # Seul l'owner peut retirer des permissions
+    if page.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only owner can manage permissions")
+    
+    success = await storage.remove_page_permission(page_id, subject_type, subject_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Permission not found")
+    
+    return {"status": "removed"}
+
+
 # ─────────────────────────────────────────────────────────────
 # WEBSOCKET ENDPOINT
 # ─────────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, token: str = None):
+async def websocket_endpoint(websocket: WebSocket):
     """
     Point d'entrée WebSocket principal
     
@@ -177,6 +378,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str = None):
     
     Le token est obtenu via POST /login
     """
+    # Récupérer le token depuis les query params
+    token = websocket.query_params.get("token")
+    
     # Authentification obligatoire
     if not token:
         await websocket.close(code=4001, reason="Token required")

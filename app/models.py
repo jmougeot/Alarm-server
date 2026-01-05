@@ -105,6 +105,14 @@ class PagePermissionBase(BaseModel):
     can_edit: bool = False
 
 
+class PagePermissionRequest(BaseModel):
+    """Permission request pour l'API (sans page_id qui est dans l'URL)"""
+    subject_type: SubjectType
+    subject_id: str
+    can_view: bool = True
+    can_edit: bool = False
+
+
 class PagePermissionCreate(PagePermissionBase):
     page_id: str
 
@@ -124,6 +132,8 @@ class AlarmBase(BaseModel):
     ticker: str
     option: str
     condition: AlarmCondition
+    strategy_id: Optional[str] = None
+    strategy_name: Optional[str] = None
 
 
 class AlarmCreate(AlarmBase):

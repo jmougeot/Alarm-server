@@ -100,7 +100,9 @@ class ConnectionManager:
                         "option": a.option,
                         "condition": a.condition.value if hasattr(a.condition, 'value') else a.condition,
                         "active": a.active,
-                        "last_triggered": a.last_triggered.isoformat() if a.last_triggered else None
+                        "last_triggered": a.last_triggered.isoformat() if a.last_triggered else None,
+                        "strategy_id": a.strategy_id,
+                        "strategy_name": a.strategy_name
                     }
                     for a in alarms
                 ]
@@ -198,39 +200,86 @@ async def send_success(websocket: WebSocket, action: str, data: dict = None):
 # ─────────────────────────────────────────────────────────────
 
 async def handle_create_alarm(websocket: WebSocket, user: User, payload: dict):
-    """Crée une alarme (vérifie permission edit sur la page)"""
+    """
+    Crée ou met à jour une alarme (upsert basé sur strategy_id)
+    Si une alarme avec le même strategy_id existe sur la page, on la met à jour
+    Sinon, on en crée une nouvelle
+    """
     from .models import AlarmCreate, AlarmCondition
     
     page_id = payload.get("page_id")
+    strategy_id = payload.get("strategy_id")
     
     # Vérifier permission
     if not await storage.can_user_edit_page(user.id, page_id):
         await send_error(websocket, "Permission denied: cannot edit this page")
         return
     
-    # Créer l'alarme
-    alarm_data = AlarmCreate(
-        page_id=page_id,
-        ticker=payload.get("ticker"),
-        option=payload.get("option"),
-        condition=AlarmCondition(payload.get("condition"))
-    )
+    # Vérifier si une alarme avec ce strategy_id existe déjà sur cette page
+    existing_alarm = None
+    if strategy_id:
+        existing_alarm = await storage.get_alarm_by_strategy_id(strategy_id, page_id)
     
-    alarm = await storage.create_alarm(alarm_data, user.id)
-    
-    # Notifier tous les users concernés
-    update = WSAlarmUpdate(
-        alarm_id=alarm.id,
-        page_id=alarm.page_id,
-        action="created",
-        data={
-            "id": alarm.id,
-            "ticker": alarm.ticker,
-            "option": alarm.option,
-            "condition": alarm.condition.value,
-            "active": alarm.active
+    if existing_alarm:
+        # Mettre à jour l'alarme existante
+        updates = {
+            "ticker": payload.get("ticker"),
+            "option": payload.get("option"),
+            "condition": payload.get("condition"),
+            "strategy_name": payload.get("strategy_name")
         }
-    )
+        # Filtrer les valeurs None
+        updates = {k: v for k, v in updates.items() if v is not None}
+        
+        alarm = await storage.update_alarm(existing_alarm.id, **updates)
+        
+        if not alarm:
+            await send_error(websocket, "Failed to update alarm")
+            return
+        
+        # Notifier avec action "updated"
+        update = WSAlarmUpdate(
+            alarm_id=alarm.id,
+            page_id=alarm.page_id,
+            action="updated",
+            data={
+                "id": alarm.id,
+                "ticker": alarm.ticker,
+                "option": alarm.option,
+                "condition": alarm.condition.value if hasattr(alarm.condition, 'value') else alarm.condition,
+                "active": alarm.active,
+                "strategy_id": alarm.strategy_id,
+                "strategy_name": alarm.strategy_name
+            }
+        )
+    else:
+        # Créer une nouvelle alarme
+        alarm_data = AlarmCreate(
+            page_id=page_id,
+            ticker=payload.get("ticker"),
+            option=payload.get("option"),
+            condition=AlarmCondition(payload.get("condition")),
+            strategy_id=strategy_id,
+            strategy_name=payload.get("strategy_name")
+        )
+        
+        alarm = await storage.create_alarm(alarm_data, user.id)
+        
+        # Notifier avec action "created"
+        update = WSAlarmUpdate(
+            alarm_id=alarm.id,
+            page_id=alarm.page_id,
+            action="created",
+            data={
+                "id": alarm.id,
+                "ticker": alarm.ticker,
+                "option": alarm.option,
+                "condition": alarm.condition.value,
+                "active": alarm.active,
+                "strategy_id": alarm.strategy_id,
+                "strategy_name": alarm.strategy_name
+            }
+        )
     
     await manager.broadcast_alarm_update(update)
 
@@ -251,7 +300,7 @@ async def handle_update_alarm(websocket: WebSocket, user: User, payload: dict):
         return
     
     # Mettre à jour
-    updates = {k: v for k, v in payload.items() if k in ["ticker", "option", "condition", "active"]}
+    updates = {k: v for k, v in payload.items() if k in ["ticker", "option", "condition", "active", "strategy_id", "strategy_name"]}
     updated_alarm = await storage.update_alarm(alarm_id, **updates)
     
     # Notifier
@@ -337,12 +386,17 @@ async def handle_create_page(websocket: WebSocket, user: User, payload: dict):
     page_data = PageCreate(name=payload.get("name"))
     page = await storage.create_page(page_data, user.id)
     
-    # Envoyer confirmation
-    await send_success(websocket, "page_created", {
-        "id": page.id,
-        "name": page.name,
-        "owner_id": page.owner_id
-    })
+    # Broadcast à toutes les connexions de l'utilisateur (multi-device sync)
+    page_update = WSMessage(
+        type="page_created",
+        payload={
+            "id": page.id,
+            "name": page.name,
+            "owner_id": page.owner_id,
+            "is_owner": True
+        }
+    )
+    await manager.send_to_user(user.id, page_update)
 
 
 async def handle_share_page(websocket: WebSocket, user: User, payload: dict):
@@ -368,8 +422,40 @@ async def handle_share_page(websocket: WebSocket, user: User, payload: dict):
     
     await storage.set_page_permission(permission_data)
     
-    await send_success(websocket, "page_shared", {
-        "page_id": page_id,
-        "subject_type": permission_data.subject_type.value,
-        "subject_id": permission_data.subject_id
-    })
+    # Notifier l'owner (toutes ses connexions)
+    await manager.send_to_user(user.id, WSMessage(
+        type="page_shared",
+        payload={
+            "page_id": page_id,
+            "subject_type": permission_data.subject_type.value,
+            "subject_id": permission_data.subject_id
+        }
+    ))
+    
+    # Si partagé avec un user, lui envoyer la page
+    if permission_data.subject_type == SubjectType.USER:
+        # Envoyer la page et ses alarmes au nouvel utilisateur
+        alarms = await storage.get_alarms_for_pages([page_id])
+        await manager.send_to_user(permission_data.subject_id, WSMessage(
+            type="page_shared_with_you",
+            payload={
+                "page": {
+                    "id": page.id,
+                    "name": page.name,
+                    "owner_id": page.owner_id,
+                    "is_owner": False
+                },
+                "alarms": [
+                    {
+                        "id": a.id,
+                        "page_id": a.page_id,
+                        "ticker": a.ticker,
+                        "option": a.option,
+                        "condition": a.condition.value if hasattr(a.condition, 'value') else a.condition,
+                        "active": a.active,
+                        "last_triggered": a.last_triggered.isoformat() if a.last_triggered else None
+                    }
+                    for a in alarms
+                ]
+            }
+        ))
