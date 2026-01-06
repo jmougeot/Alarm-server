@@ -204,17 +204,14 @@ async def create_group(group: GroupCreate) -> Group:
 
 
 async def add_user_to_group(user_id: str, group_id: str) -> bool:
-    """Ajoute un utilisateur à un groupe"""
+    """Ajoute un utilisateur à un groupe (idempotent - ignore si déjà membre)"""
     async with get_db() as db:
-        try:
-            await db.execute(
-                "INSERT INTO user_groups (user_id, group_id) VALUES (?, ?)",
-                (user_id, group_id)
-            )
-            await db.commit()
-            return True
-        except aiosqlite.IntegrityError:
-            return False
+        await db.execute(
+            "INSERT OR IGNORE INTO user_groups (user_id, group_id) VALUES (?, ?)",
+            (user_id, group_id)
+        )
+        await db.commit()
+        return True
 
 
 async def get_user_groups(user_id: str) -> List[str]:
@@ -257,6 +254,20 @@ async def create_page(page: PageCreate, owner_id: str) -> Page:
         await db.commit()
     
     return Page(id=page_id, name=page.name, owner_id=owner_id, created_at=created_at)
+
+
+async def delete_page(page_id: str) -> bool:
+    """
+    Supprime une page et toutes ses dépendances (CASCADE)
+    Retourne True si la page a été supprimée
+    """
+    async with get_db() as db:
+        cursor = await db.execute(
+            "DELETE FROM pages WHERE id = ?",
+            (page_id,)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 async def get_page_by_id(page_id: str) -> Optional[Page]:
@@ -531,8 +542,14 @@ async def get_alarm_by_id(alarm_id: str) -> Optional[Alarm]:
 
 async def get_alarm_by_strategy_id(strategy_id: str, page_id: str) -> Optional[Alarm]:
     """Récupère une alarme par son strategy_id sur une page donnée"""
+    import logging
+    logger = logging.getLogger(__name__)
+    
     if not strategy_id:
+        logger.debug(f"[get_alarm_by_strategy_id] strategy_id is empty/None, returning None")
         return None
+    
+    logger.debug(f"[get_alarm_by_strategy_id] Looking for strategy_id='{strategy_id}' on page_id='{page_id}'")
     
     async with get_db() as db:
         cursor = await db.execute(
@@ -545,6 +562,7 @@ async def get_alarm_by_strategy_id(strategy_id: str, page_id: str) -> Optional[A
         )
         row = await cursor.fetchone()
         if row:
+            logger.debug(f"[get_alarm_by_strategy_id] FOUND alarm id={row['id']} for strategy_id='{strategy_id}'")
             return Alarm(
                 id=row["id"],
                 page_id=row["page_id"],
@@ -558,6 +576,7 @@ async def get_alarm_by_strategy_id(strategy_id: str, page_id: str) -> Optional[A
                 created_at=row["created_at"],
                 last_triggered=row["last_triggered"]
             )
+        logger.debug(f"[get_alarm_by_strategy_id] NOT FOUND for strategy_id='{strategy_id}'")
         return None
 
 
@@ -618,9 +637,8 @@ async def update_alarm(alarm_id: str, **kwargs) -> Optional[Alarm]:
     
     return await get_alarm_by_id(alarm_id)
 
-
 async def delete_alarm(alarm_id: str) -> bool:
-    """Supprime une alarme"""
+    """Supprime une alarme par son ID"""
     async with get_db() as db:
         cursor = await db.execute(
             "DELETE FROM alarms WHERE id = ?",
@@ -628,6 +646,76 @@ async def delete_alarm(alarm_id: str) -> bool:
         )
         await db.commit()
         return cursor.rowcount > 0
+
+
+async def delete_alarms_by_strategy_id(strategy_id: str, page_id: str) -> int:
+    """
+    Supprime toutes les alarmes avec un strategy_id donné sur une page
+    Retourne le nombre d'alarmes supprimées
+    """
+    async with get_db() as db:
+        cursor = await db.execute(
+            "DELETE FROM alarms WHERE strategy_id = ? AND page_id = ?",
+            (strategy_id, page_id)
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
+async def get_alarms_by_strategy_id(strategy_id: str) -> List[Alarm]:
+    """
+    Récupère toutes les alarmes avec un strategy_id donné (toutes pages confondues)
+    """
+    if not strategy_id:
+        return []
+    
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT id, page_id, ticker, option, condition, strategy_id, strategy_name,
+                   created_by, active, created_at, last_triggered
+            FROM alarms WHERE strategy_id = ?
+            """,
+            (strategy_id,)
+        )
+        rows = await cursor.fetchall()
+        return [
+            Alarm(
+                id=row["id"],
+                page_id=row["page_id"],
+                ticker=row["ticker"],
+                option=row["option"],
+                condition=row["condition"],
+                strategy_id=row["strategy_id"],
+                strategy_name=row["strategy_name"],
+                created_by=row["created_by"],
+                active=bool(row["active"]),
+                created_at=row["created_at"],
+                last_triggered=row["last_triggered"]
+            )
+            for row in rows
+        ]
+
+
+async def delete_alarms_by_strategy_id_global(strategy_id: str) -> tuple[int, set]:
+    """
+    Supprime toutes les alarmes avec un strategy_id donné (toutes pages)
+    Retourne (nombre supprimé, set des page_ids affectés)
+    """
+    if not strategy_id:
+        return 0, set()
+    
+    # D'abord récupérer les page_ids pour le broadcast
+    alarms = await get_alarms_by_strategy_id(strategy_id)
+    page_ids = {a.page_id for a in alarms}
+    
+    async with get_db() as db:
+        cursor = await db.execute(
+            "DELETE FROM alarms WHERE strategy_id = ?",
+            (strategy_id,)
+        )
+        await db.commit()
+        return cursor.rowcount, page_ids
 
 
 async def trigger_alarm(alarm_id: str, triggered_by: str, price: Optional[float] = None) -> Optional[AlarmEvent]:

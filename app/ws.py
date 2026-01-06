@@ -4,12 +4,16 @@ Le serveur filtre TOUT — pas de filtrage client
 """
 
 import json
+import logging
 from typing import Dict, Set, Optional
 from fastapi import WebSocket, WebSocketDisconnect
 
 from .models import User, WSMessage, WSAlarmUpdate
 from . import storage
 
+# Configuration du logger
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 # ─────────────────────────────────────────────────────────────
 # CONNECTION MANAGER
@@ -35,12 +39,15 @@ class ConnectionManager:
         await websocket.accept()
         
         user_id = user.id
+        logger.info(f"[WS CONNECT] User '{user.username}' (id={user_id}) connected")
         
         if user_id not in self._connections:
             self._connections[user_id] = set()
         
         self._connections[user_id].add(websocket)
         self._user_by_ws[websocket] = user_id
+        
+        logger.debug(f"[WS CONNECT] User '{user.username}' now has {len(self._connections[user_id])} active connection(s)")
         
         # Envoyer les données initiales
         await self._send_initial_data(websocket, user)
@@ -50,6 +57,7 @@ class ConnectionManager:
         user_id = self._user_by_ws.get(websocket)
         
         if user_id:
+            logger.info(f"[WS DISCONNECT] User id={user_id} disconnected")
             self._connections[user_id].discard(websocket)
             
             # Nettoyer si plus de connexions
@@ -147,11 +155,9 @@ class ConnectionManager:
 # Singleton global
 manager = ConnectionManager()
 
-
 # ─────────────────────────────────────────────────────────────
 # MESSAGE HANDLERS
 # ─────────────────────────────────────────────────────────────
-
 async def handle_message(websocket: WebSocket, user: User, data: dict):
     """
     Traite les messages entrants WebSocket
@@ -160,12 +166,15 @@ async def handle_message(websocket: WebSocket, user: User, data: dict):
     msg_type = data.get("type")
     payload = data.get("payload", {})
     
+    logger.debug(f"[WS MESSAGE] User '{user.username}' -> type='{msg_type}' payload={payload}")
+    
     handlers = {
         "create_alarm": handle_create_alarm,
         "update_alarm": handle_update_alarm,
         "delete_alarm": handle_delete_alarm,
         "trigger_alarm": handle_trigger_alarm,
         "create_page": handle_create_page,
+        "delete_page": handle_delete_page,
         "share_page": handle_share_page,
     }
     
@@ -179,12 +188,10 @@ async def handle_message(websocket: WebSocket, user: User, data: dict):
     else:
         await send_error(websocket, f"Unknown message type: {msg_type}")
 
-
 async def send_error(websocket: WebSocket, error: str):
     """Envoie une erreur au client"""
     message = WSMessage(type="error", payload={"message": error})
     await websocket.send_json(message.model_dump())
-
 
 async def send_success(websocket: WebSocket, action: str, data: dict = None):
     """Envoie une confirmation de succès"""
@@ -193,7 +200,6 @@ async def send_success(websocket: WebSocket, action: str, data: dict = None):
         payload={"action": action, "data": data or {}}
     )
     await websocket.send_json(message.model_dump())
-
 
 # ─────────────────────────────────────────────────────────────
 # HANDLERS SPÉCIFIQUES
@@ -210,8 +216,11 @@ async def handle_create_alarm(websocket: WebSocket, user: User, payload: dict):
     page_id = payload.get("page_id")
     strategy_id = payload.get("strategy_id")
     
+    logger.debug(f"[CREATE_ALARM] User '{user.username}' - page_id={page_id}, strategy_id={strategy_id}")
+    
     # Vérifier permission
     if not await storage.can_user_edit_page(user.id, page_id):
+        logger.warning(f"[CREATE_ALARM] DENIED - User '{user.username}' cannot edit page {page_id}")
         await send_error(websocket, "Permission denied: cannot edit this page")
         return
     
@@ -221,6 +230,7 @@ async def handle_create_alarm(websocket: WebSocket, user: User, payload: dict):
         existing_alarm = await storage.get_alarm_by_strategy_id(strategy_id, page_id)
     
     if existing_alarm:
+        logger.info(f"[CREATE_ALARM] UPSERT - Updating existing alarm {existing_alarm.id} (strategy_id={strategy_id})")
         # Mettre à jour l'alarme existante
         updates = {
             "ticker": payload.get("ticker"),
@@ -234,6 +244,7 @@ async def handle_create_alarm(websocket: WebSocket, user: User, payload: dict):
         alarm = await storage.update_alarm(existing_alarm.id, **updates)
         
         if not alarm:
+            logger.error(f"[CREATE_ALARM] FAILED - Could not update alarm {existing_alarm.id}")
             await send_error(websocket, "Failed to update alarm")
             return
         
@@ -254,6 +265,7 @@ async def handle_create_alarm(websocket: WebSocket, user: User, payload: dict):
         )
     else:
         # Créer une nouvelle alarme
+        logger.info(f"[CREATE_ALARM] NEW - Creating alarm for strategy_id={strategy_id}, ticker={payload.get('ticker')}")
         alarm_data = AlarmCreate(
             page_id=page_id,
             ticker=payload.get("ticker"),
@@ -264,6 +276,7 @@ async def handle_create_alarm(websocket: WebSocket, user: User, payload: dict):
         )
         
         alarm = await storage.create_alarm(alarm_data, user.id)
+        logger.debug(f"[CREATE_ALARM] SUCCESS - Created alarm id={alarm.id}")
         
         # Notifier avec action "created"
         update = WSAlarmUpdate(
@@ -287,20 +300,24 @@ async def handle_create_alarm(websocket: WebSocket, user: User, payload: dict):
 async def handle_update_alarm(websocket: WebSocket, user: User, payload: dict):
     """Met à jour une alarme"""
     alarm_id = payload.get("alarm_id")
+    logger.debug(f"[UPDATE_ALARM] User '{user.username}' - alarm_id={alarm_id}")
     
     # Récupérer l'alarme
     alarm = await storage.get_alarm_by_id(alarm_id)
     if not alarm:
+        logger.warning(f"[UPDATE_ALARM] NOT FOUND - alarm_id={alarm_id}")
         await send_error(websocket, "Alarm not found")
         return
     
     # Vérifier permission
     if not await storage.can_user_edit_page(user.id, alarm.page_id):
+        logger.warning(f"[UPDATE_ALARM] DENIED - User '{user.username}' cannot edit page {alarm.page_id}")
         await send_error(websocket, "Permission denied: cannot edit this alarm")
         return
     
     # Mettre à jour
     updates = {k: v for k, v in payload.items() if k in ["ticker", "option", "condition", "active", "strategy_id", "strategy_name"]}
+    logger.info(f"[UPDATE_ALARM] SUCCESS - alarm_id={alarm_id}, updates={updates}")
     updated_alarm = await storage.update_alarm(alarm_id, **updates)
     
     # Notifier
@@ -315,17 +332,70 @@ async def handle_update_alarm(websocket: WebSocket, user: User, payload: dict):
 
 
 async def handle_delete_alarm(websocket: WebSocket, user: User, payload: dict):
-    """Supprime une alarme"""
+    """
+    Supprime une ou plusieurs alarmes
+    - Si strategy_id fourni : supprime toutes les alarmes avec ce strategy_id
+    - Sinon : supprime l'alarme spécifique par alarm_id
+    """
     alarm_id = payload.get("alarm_id")
+    strategy_id = payload.get("strategy_id")
+    page_id = payload.get("page_id")
+    
+    logger.debug(f"[DELETE_ALARM] User '{user.username}' - alarm_id={alarm_id}, strategy_id={strategy_id}, page_id={page_id}")
+    
+    # Cas 1 : Suppression par strategy_id
+    if strategy_id:
+        logger.info(f"[DELETE_ALARM] BY STRATEGY - strategy_id={strategy_id}")
+        
+        # Récupérer les alarmes avec ce strategy_id pour vérifier les permissions
+        alarms = await storage.get_alarms_by_strategy_id(strategy_id)
+        
+        if not alarms:
+            logger.warning(f"[DELETE_ALARM] NO MATCH - No alarms with strategy_id={strategy_id}")
+            await send_error(websocket, "No alarms found with this strategy_id")
+            return
+        
+        # Vérifier permission sur toutes les pages concernées
+        page_ids_to_notify = set()
+        for alarm in alarms:
+            if not await storage.can_user_edit_page(user.id, alarm.page_id):
+                logger.warning(f"[DELETE_ALARM] DENIED - User '{user.username}' cannot edit page {alarm.page_id}")
+                await send_error(websocket, f"Permission denied: cannot edit page {alarm.page_id}")
+                return
+            page_ids_to_notify.add(alarm.page_id)
+        
+        # Supprimer toutes les alarmes avec ce strategy_id
+        count, _ = await storage.delete_alarms_by_strategy_id_global(strategy_id)
+        logger.info(f"[DELETE_ALARM] DELETED {count} alarms with strategy_id={strategy_id}")
+        
+        # Notifier toutes les pages affectées
+        for pid in page_ids_to_notify:
+            update = WSAlarmUpdate(
+                alarm_id=strategy_id,  # Utiliser strategy_id comme identifiant
+                page_id=pid,
+                action="deleted",
+                data={"strategy_id": strategy_id, "count": count}
+            )
+            await manager.broadcast_alarm_update(update)
+        
+        return
+    
+    # Cas 2 : Suppression par alarm_id (comportement original)
+    if not alarm_id:
+        logger.warning(f"[DELETE_ALARM] MISSING - No alarm_id or strategy_id provided")
+        await send_error(websocket, "Missing alarm_id or strategy_id")
+        return
     
     # Récupérer l'alarme
     alarm = await storage.get_alarm_by_id(alarm_id)
     if not alarm:
+        logger.warning(f"[DELETE_ALARM] NOT FOUND - alarm_id={alarm_id}")
         await send_error(websocket, "Alarm not found")
         return
     
     # Vérifier permission
     if not await storage.can_user_edit_page(user.id, alarm.page_id):
+        logger.warning(f"[DELETE_ALARM] DENIED - User '{user.username}' cannot edit page {alarm.page_id}")
         await send_error(websocket, "Permission denied: cannot delete this alarm")
         return
     
@@ -333,6 +403,7 @@ async def handle_delete_alarm(websocket: WebSocket, user: User, payload: dict):
     
     # Supprimer
     await storage.delete_alarm(alarm_id)
+    logger.info(f"[DELETE_ALARM] SUCCESS - Deleted alarm_id={alarm_id}")
     
     # Notifier
     update = WSAlarmUpdate(
@@ -350,19 +421,24 @@ async def handle_trigger_alarm(websocket: WebSocket, user: User, payload: dict):
     alarm_id = payload.get("alarm_id")
     price = payload.get("price")
     
+    logger.debug(f"[TRIGGER_ALARM] User '{user.username}' - alarm_id={alarm_id}, price={price}")
+    
     # Récupérer l'alarme
     alarm = await storage.get_alarm_by_id(alarm_id)
     if not alarm:
+        logger.warning(f"[TRIGGER_ALARM] NOT FOUND - alarm_id={alarm_id}")
         await send_error(websocket, "Alarm not found")
         return
     
     # Vérifier permission (view suffit pour trigger)
     if not await storage.can_user_view_page(user.id, alarm.page_id):
+        logger.warning(f"[TRIGGER_ALARM] DENIED - User '{user.username}' cannot view page {alarm.page_id}")
         await send_error(websocket, "Permission denied: cannot access this alarm")
         return
     
     # Enregistrer le déclenchement
     event = await storage.trigger_alarm(alarm_id, user.id, price)
+    logger.info(f"[TRIGGER_ALARM] SUCCESS - alarm_id={alarm_id} triggered by '{user.username}'")
     
     # Notifier
     update = WSAlarmUpdate(
@@ -383,8 +459,12 @@ async def handle_create_page(websocket: WebSocket, user: User, payload: dict):
     """Crée une nouvelle page"""
     from .models import PageCreate
     
-    page_data = PageCreate(name=payload.get("name"))
+    page_name = payload.get("name")
+    logger.debug(f"[CREATE_PAGE] User '{user.username}' - name='{page_name}'")
+    
+    page_data = PageCreate(name=page_name)
     page = await storage.create_page(page_data, user.id)
+    logger.info(f"[CREATE_PAGE] SUCCESS - Created page id={page.id}, name='{page.name}'")
     
     # Broadcast à toutes les connexions de l'utilisateur (multi-device sync)
     page_update = WSMessage(
@@ -399,15 +479,60 @@ async def handle_create_page(websocket: WebSocket, user: User, payload: dict):
     await manager.send_to_user(user.id, page_update)
 
 
+async def handle_delete_page(websocket: WebSocket, user: User, payload: dict):
+    """Supprime une page (seul l'owner peut supprimer)"""
+    page_id = payload.get("page_id")
+    logger.debug(f"[DELETE_PAGE] User '{user.username}' - page_id={page_id}")
+    
+    # Vérifier que la page existe et que l'user est owner
+    page = await storage.get_page_by_id(page_id)
+    if not page:
+        logger.warning(f"[DELETE_PAGE] NOT FOUND - page_id={page_id}")
+        await send_error(websocket, "Page not found")
+        return
+    
+    if page.owner_id != user.id:
+        logger.warning(f"[DELETE_PAGE] DENIED - User '{user.username}' is not owner of page {page_id}")
+        await send_error(websocket, "Permission denied: only owner can delete page")
+        return
+    
+    # Récupérer tous les users avec accès avant suppression (pour notifier)
+    user_ids = await storage.get_users_with_page_access(page_id)
+    
+    # Supprimer la page (CASCADE supprime alarmes et permissions)
+    success = await storage.delete_page(page_id)
+    
+    if not success:
+        logger.error(f"[DELETE_PAGE] FAILED - Could not delete page {page_id}")
+        await send_error(websocket, "Failed to delete page")
+        return
+    
+    logger.info(f"[DELETE_PAGE] SUCCESS - Deleted page {page_id}, notifying {len(user_ids)} users")
+    
+    # Notifier tous les users qui avaient accès
+    delete_message = WSMessage(
+        type="page_deleted",
+        payload={"page_id": page_id}
+    )
+    
+    for uid in user_ids:
+        await manager.send_to_user(uid, delete_message)
+
+
 async def handle_share_page(websocket: WebSocket, user: User, payload: dict):
     """Partage une page avec un user ou groupe"""
     from .models import PagePermissionCreate, SubjectType
     
     page_id = payload.get("page_id")
+    subject_type = payload.get("subject_type")
+    subject_id = payload.get("subject_id")
+    
+    logger.debug(f"[SHARE_PAGE] User '{user.username}' - page_id={page_id}, subject_type={subject_type}, subject_id={subject_id}")
     
     # Vérifier que l'user est owner
     page = await storage.get_page_by_id(page_id)
     if not page or page.owner_id != user.id:
+        logger.warning(f"[SHARE_PAGE] DENIED - User '{user.username}' is not owner of page {page_id}")
         await send_error(websocket, "Permission denied: only owner can share")
         return
     
@@ -421,6 +546,7 @@ async def handle_share_page(websocket: WebSocket, user: User, payload: dict):
     )
     
     await storage.set_page_permission(permission_data)
+    logger.info(f"[SHARE_PAGE] SUCCESS - Shared page {page_id} with {permission_data.subject_type.value}={permission_data.subject_id}")
     
     # Notifier l'owner (toutes ses connexions)
     await manager.send_to_user(user.id, WSMessage(

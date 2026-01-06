@@ -270,6 +270,27 @@ async def list_pages(current_user: User = Depends(auth.get_current_user)):
     ]
 
 
+@app.delete("/pages/{page_id}")
+async def delete_page(
+    page_id: str,
+    current_user: User = Depends(auth.get_current_user)
+):
+    """Supprime une page (seul l'owner peut supprimer)"""
+    page = await storage.get_page_by_id(page_id)
+    if not page:
+        raise HTTPException(status_code=404, detail="Page not found")
+    
+    # Seul l'owner peut supprimer
+    if page.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only owner can delete page")
+    
+    success = await storage.delete_page(page_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete page")
+    
+    return {"status": "deleted", "page_id": page_id}
+
+
 @app.get("/pages/{page_id}/permissions")
 async def get_page_permissions(
     page_id: str,
