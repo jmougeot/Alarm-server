@@ -409,6 +409,53 @@ async def add_page_permission(
     
     permission = await storage.set_page_permission(perm_create)
     
+    # Notifier les utilisateurs concernés par le nouveau partage
+    from .models import WSMessage, SubjectType
+    
+    # Récupérer les alarmes de la page
+    alarms = await storage.get_alarms_for_pages([page_id])
+    page_shared_message = WSMessage(
+        type="page_shared_with_you",
+        payload={
+            "page": {
+                "id": page.id,
+                "name": page.name,
+                "owner_id": page.owner_id,
+                "is_owner": False
+            },
+            "alarms": [
+                {
+                    "id": a.id,
+                    "page_id": a.page_id,
+                    "ticker": a.ticker,
+                    "option": a.option,
+                    "condition": a.condition.value if hasattr(a.condition, 'value') else a.condition,
+                    "active": a.active,
+                    "last_triggered": a.last_triggered.isoformat() if a.last_triggered else None,
+                    "strategy_id": a.strategy_id,
+                    "strategy_name": a.strategy_name,
+                    "leg_index": a.leg_index,
+                    "position": a.position,
+                    "quantity": a.quantity,
+                    "client": a.client,
+                    "action": a.action
+                }
+                for a in alarms
+            ]
+        }
+    )
+    
+    if permission_data.subject_type == SubjectType.USER:
+        # Partage avec un user - lui envoyer la page
+        await manager.send_to_user(permission_data.subject_id, page_shared_message)
+    elif permission_data.subject_type == SubjectType.GROUP:
+        # Partage avec un groupe - envoyer à tous les membres du groupe
+        group_members = await storage.get_group_members(permission_data.subject_id)
+        for member in group_members:
+            # Ne pas renvoyer au owner (il a déjà la page)
+            if member.id != current_user.id:
+                await manager.send_to_user(member.id, page_shared_message)
+    
     return {
         "subject_type": permission.subject_type.value,
         "subject_id": permission.subject_id,
@@ -425,6 +472,8 @@ async def remove_page_permission(
     current_user: User = Depends(auth.get_current_user)
 ):
     """Retire une permission d'une page"""
+    from .models import WSMessage, SubjectType
+    
     page = await storage.get_page_by_id(page_id)
     if not page:
         raise HTTPException(status_code=404, detail="Page not found")
@@ -433,9 +482,29 @@ async def remove_page_permission(
     if page.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only owner can manage permissions")
     
+    # Récupérer les users à notifier AVANT de supprimer la permission
+    users_to_notify = []
+    if subject_type == "user":
+        users_to_notify = [subject_id]
+    elif subject_type == "group":
+        group_members = await storage.get_group_members(subject_id)
+        users_to_notify = [m.id for m in group_members if m.id != current_user.id]
+    
     success = await storage.remove_page_permission(page_id, subject_type, subject_id)
     if not success:
         raise HTTPException(status_code=404, detail="Permission not found")
+    
+    # Notifier les utilisateurs qui ont perdu l'accès
+    permission_removed_message = WSMessage(
+        type="page_access_revoked",
+        payload={"page_id": page_id}
+    )
+    
+    for user_id in users_to_notify:
+        # Vérifier si l'user a encore accès via d'autres permissions
+        still_has_access = await storage.can_user_view_page(user_id, page_id)
+        if not still_has_access:
+            await manager.send_to_user(user_id, permission_removed_message)
     
     return {"status": "removed"}
 
