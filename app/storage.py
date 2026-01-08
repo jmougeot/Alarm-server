@@ -918,3 +918,31 @@ async def remove_page_permission(page_id: str, subject_type: str, subject_id: st
         )
         await db.commit()
         return cursor.rowcount > 0
+
+
+async def get_pages_shared_with_group(group_id: str) -> List[Page]:
+    """
+    Récupère toutes les pages partagées avec un groupe spécifique
+    (pour notifier un utilisateur qui rejoint le groupe)
+    """
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT p.id, p.name, p.owner_id, p.created_at
+            FROM pages p
+            INNER JOIN page_permissions pp ON p.id = pp.page_id
+            WHERE pp.subject_type = 'group' AND pp.subject_id = ? AND pp.can_view = 1
+            """,
+            (group_id,)
+        )
+        rows = await cursor.fetchall()
+        
+        return [
+            Page(
+                id=row["id"],
+                name=row["name"],
+                owner_id=row["owner_id"],
+                created_at=row["created_at"]
+            )
+            for row in rows
+        ]

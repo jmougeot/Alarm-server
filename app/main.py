@@ -12,8 +12,8 @@ from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 
 from .models import User, UserCreate, Token, GroupCreate, PageCreate, PagePermissionCreate, PagePermissionRequest
+from .ws import manager, handle_message, WSMessage
 from . import storage, auth
-from .ws import manager, handle_message
 
 
 # ─────────────────────────────────────────────────────────────
@@ -137,6 +137,41 @@ async def add_member_to_group(
     success = await storage.add_user_to_group(user_id, group_id)
     if not success:
         raise HTTPException(status_code=400, detail="Could not add user to group")
+    
+    # Notifier le nouvel utilisateur des pages partagées avec ce groupe
+    pages_shared = await storage.get_pages_shared_with_group(group_id)
+    
+    for page in pages_shared:
+        # Récupérer les alarmes de la page
+        alarms = await storage.get_alarms_for_pages([page.id])
+        
+        # Envoyer la page et ses alarmes au nouvel utilisateur du groupe
+        await manager.send_to_user(user_id, WSMessage(
+            type="page_shared_with_you",
+            payload={
+                "page": {
+                    "id": page.id,
+                    "name": page.name,
+                    "owner_id": page.owner_id,
+                    "is_owner": False
+                },
+                "alarms": [
+                    {
+                        "id": a.id,
+                        "page_id": a.page_id,
+                        "ticker": a.ticker,
+                        "option": a.option,
+                        "condition": a.condition.value if hasattr(a.condition, 'value') else a.condition,
+                        "active": a.active,
+                        "last_triggered": a.last_triggered.isoformat() if a.last_triggered else None,
+                        "strategy_id": a.strategy_id,
+                        "strategy_name": a.strategy_name
+                    }
+                    for a in alarms
+                ]
+            }
+        ))
+    
     return {"status": "added"}
 
 
@@ -414,20 +449,45 @@ async def websocket_endpoint(websocket: WebSocket):
         return
     
     # Connexion acceptée
-    await manager.connect(websocket, user)
+    try:
+        await manager.connect(websocket, user)
+    except Exception as e:
+        print(f"[WS ERROR] Failed to connect user {user.username}: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            await websocket.close(code=1011, reason="Connection setup failed")
+        except Exception:
+            pass
+        return
     
     try:
         while True:
-            # Recevoir les messages
-            data = await websocket.receive_json()
+            # Recevoir les messages avec timeout pour détecter connexions mortes
+            try:
+                data = await websocket.receive_json()
+            except ValueError as json_err:
+                # JSON invalide - envoyer erreur mais continuer
+                print(f"[WS ERROR] Invalid JSON from {user.username}: {json_err}")
+                continue
             
             # Traiter le message
-            await handle_message(websocket, user, data)
+            try:
+                await handle_message(websocket, user, data)
+            except Exception as handler_err:
+                print(f"[WS ERROR] Handler error for {user.username}: {handler_err}")
+                import traceback
+                traceback.print_exc()
+                # Continuer la boucle, ne pas fermer la connexion
             
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        pass  # Déconnexion normale
     except Exception as e:
-        print(f"WebSocket error for user {user.username}: {e}")
+        print(f"[WS ERROR] Unexpected error for user {user.username}: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Toujours nettoyer la connexion
         manager.disconnect(websocket)
 
 

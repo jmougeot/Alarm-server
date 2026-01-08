@@ -11,9 +11,11 @@ from fastapi import WebSocket, WebSocketDisconnect
 from .models import User, WSMessage, WSAlarmUpdate
 from . import storage
 
-# Configuration du logger
+# Configuration du logger - INFO en prod, DEBUG uniquement si variable d'env
+import os
+log_level = logging.DEBUG if os.getenv("DEBUG", "").lower() == "true" else logging.INFO
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=log_level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 # ─────────────────────────────────────────────────────────────
 # CONNECTION MANAGER
@@ -76,12 +78,18 @@ class ConnectionManager:
         - Pages accessibles
         - Alarmes de ces pages
         """
-        # Récupérer les pages accessibles
-        pages = await storage.get_accessible_pages(user.id)
-        page_ids = [p.id for p in pages]
-        
-        # Récupérer les alarmes de ces pages
-        alarms = await storage.get_alarms_for_pages(page_ids)
+        try:
+            # Récupérer les pages accessibles
+            pages = await storage.get_accessible_pages(user.id)
+            page_ids = [p.id for p in pages]
+            
+            # Récupérer les alarmes de ces pages
+            alarms = await storage.get_alarms_for_pages(page_ids)
+        except Exception as e:
+            logger.error(f"[WS INIT] Failed to fetch initial data for user {user.username}: {e}")
+            # Envoyer un état initial vide plutôt que crasher
+            pages = []
+            alarms = []
         
         # Envoyer le state initial
         initial_state = WSMessage(
@@ -117,18 +125,29 @@ class ConnectionManager:
             }
         )
         
-        await websocket.send_json(initial_state.model_dump())
+        try:
+            await websocket.send_json(initial_state.model_dump())
+        except Exception as e:
+            logger.error(f"[WS INIT] Failed to send initial state to {user.username}: {e}")
+            raise  # Remonter pour que connect() puisse gérer
     
     async def send_to_user(self, user_id: str, message: WSMessage):
         """Envoie un message à toutes les connexions d'un user"""
         connections = self._connections.get(user_id, set())
         
-        for ws in connections.copy():
+        # Copier pour éviter modification pendant itération
+        dead_connections = []
+        for ws in list(connections):
             try:
                 await ws.send_json(message.model_dump())
-            except Exception:
-                # Connexion morte, nettoyer
-                self.disconnect(ws)
+            except Exception as e:
+                # Connexion morte, marquer pour nettoyage
+                logger.debug(f"[WS SEND] Failed to send to user {user_id}: {e}")
+                dead_connections.append(ws)
+        
+        # Nettoyer les connexions mortes après l'itération
+        for ws in dead_connections:
+            self.disconnect(ws)
     
     async def broadcast_to_page_users(self, page_id: str, message: WSMessage):
         """
@@ -558,30 +577,42 @@ async def handle_share_page(websocket: WebSocket, user: User, payload: dict):
         }
     ))
     
-    # Si partagé avec un user, lui envoyer la page
+    # Récupérer les alarmes de la page pour les envoyer aux nouveaux utilisateurs
+    alarms = await storage.get_alarms_for_pages([page_id])
+    page_shared_message = WSMessage(
+        type="page_shared_with_you",
+        payload={
+            "page": {
+                "id": page.id,
+                "name": page.name,
+                "owner_id": page.owner_id,
+                "is_owner": False
+            },
+            "alarms": [
+                {
+                    "id": a.id,
+                    "page_id": a.page_id,
+                    "ticker": a.ticker,
+                    "option": a.option,
+                    "condition": a.condition.value if hasattr(a.condition, 'value') else a.condition,
+                    "active": a.active,
+                    "last_triggered": a.last_triggered.isoformat() if a.last_triggered else None,
+                    "strategy_id": a.strategy_id,
+                    "strategy_name": a.strategy_name
+                }
+                for a in alarms
+            ]
+        }
+    )
+    
+    # Notifier les utilisateurs concernés
     if permission_data.subject_type == SubjectType.USER:
-        # Envoyer la page et ses alarmes au nouvel utilisateur
-        alarms = await storage.get_alarms_for_pages([page_id])
-        await manager.send_to_user(permission_data.subject_id, WSMessage(
-            type="page_shared_with_you",
-            payload={
-                "page": {
-                    "id": page.id,
-                    "name": page.name,
-                    "owner_id": page.owner_id,
-                    "is_owner": False
-                },
-                "alarms": [
-                    {
-                        "id": a.id,
-                        "page_id": a.page_id,
-                        "ticker": a.ticker,
-                        "option": a.option,
-                        "condition": a.condition.value if hasattr(a.condition, 'value') else a.condition,
-                        "active": a.active,
-                        "last_triggered": a.last_triggered.isoformat() if a.last_triggered else None
-                    }
-                    for a in alarms
-                ]
-            }
-        ))
+        # Partage avec un user - lui envoyer la page
+        await manager.send_to_user(permission_data.subject_id, page_shared_message)
+    elif permission_data.subject_type == SubjectType.GROUP:
+        # Partage avec un groupe - envoyer à tous les membres du groupe
+        group_members = await storage.get_group_members(permission_data.subject_id)
+        for member in group_members:
+            # Ne pas renvoyer au owner (il a déjà la page)
+            if member.id != user.id:
+                await manager.send_to_user(member.id, page_shared_message)
