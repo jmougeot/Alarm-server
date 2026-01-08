@@ -283,6 +283,20 @@ async def create_page(
 ):
     """Crée une nouvelle page"""
     page = await storage.create_page(page_data, current_user.id)
+    
+    # Notifier le client via WebSocket (multi-device sync)
+    from .models import WSMessage
+    page_update = WSMessage(
+        type="page_created",
+        payload={
+            "id": page.id,
+            "name": page.name,
+            "owner_id": page.owner_id,
+            "is_owner": True
+        }
+    )
+    await manager.send_to_user(current_user.id, page_update)
+    
     return {
         "id": page.id,
         "name": page.name,
