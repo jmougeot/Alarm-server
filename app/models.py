@@ -134,6 +134,11 @@ class AlarmBase(BaseModel):
     condition: AlarmCondition
     strategy_id: Optional[str] = None
     strategy_name: Optional[str] = None
+    leg_index: Optional[int] = None
+    position: Optional[str] = None  # 'long' or 'short'
+    quantity: Optional[int] = None
+    client: Optional[str] = None
+    action: Optional[str] = None
 
 
 class AlarmCreate(AlarmBase):

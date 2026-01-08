@@ -118,7 +118,12 @@ class ConnectionManager:
                         "active": a.active,
                         "last_triggered": a.last_triggered.isoformat() if a.last_triggered else None,
                         "strategy_id": a.strategy_id,
-                        "strategy_name": a.strategy_name
+                        "strategy_name": a.strategy_name,
+                        "leg_index": a.leg_index,
+                        "position": a.position,
+                        "quantity": a.quantity,
+                        "client": a.client,
+                        "action": a.action
                     }
                     for a in alarms
                 ]
@@ -226,16 +231,18 @@ async def send_success(websocket: WebSocket, action: str, data: dict = None):
 
 async def handle_create_alarm(websocket: WebSocket, user: User, payload: dict):
     """
-    Crée ou met à jour une alarme (upsert basé sur strategy_id)
-    Si une alarme avec le même strategy_id existe sur la page, on la met à jour
+    Crée ou met à jour une alarme (upsert basé sur strategy_id + leg_index)
+    Si une alarme avec le même strategy_id ET leg_index existe sur la page, on la met à jour
     Sinon, on en crée une nouvelle
+    Cela permet d'avoir plusieurs legs par stratégie
     """
     from .models import AlarmCreate, AlarmCondition
     
     page_id = payload.get("page_id")
     strategy_id = payload.get("strategy_id")
+    leg_index = payload.get("leg_index", 0)  # Défaut à 0 si non spécifié
     
-    logger.debug(f"[CREATE_ALARM] User '{user.username}' - page_id={page_id}, strategy_id={strategy_id}")
+    logger.debug(f"[CREATE_ALARM] User '{user.username}' - page_id={page_id}, strategy_id={strategy_id}, leg_index={leg_index}")
     
     # Vérifier permission
     if not await storage.can_user_edit_page(user.id, page_id):
@@ -243,19 +250,24 @@ async def handle_create_alarm(websocket: WebSocket, user: User, payload: dict):
         await send_error(websocket, "Permission denied: cannot edit this page")
         return
     
-    # Vérifier si une alarme avec ce strategy_id existe déjà sur cette page
+    # Vérifier si une alarme avec ce strategy_id ET leg_index existe déjà sur cette page
     existing_alarm = None
     if strategy_id:
-        existing_alarm = await storage.get_alarm_by_strategy_id(strategy_id, page_id)
+        existing_alarm = await storage.get_alarm_by_strategy_and_leg(strategy_id, page_id, leg_index)
     
     if existing_alarm:
-        logger.info(f"[CREATE_ALARM] UPSERT - Updating existing alarm {existing_alarm.id} (strategy_id={strategy_id})")
+        logger.info(f"[CREATE_ALARM] UPSERT - Updating existing alarm {existing_alarm.id} (strategy_id={strategy_id}, leg_index={leg_index})")
         # Mettre à jour l'alarme existante
         updates = {
             "ticker": payload.get("ticker"),
             "option": payload.get("option"),
             "condition": payload.get("condition"),
-            "strategy_name": payload.get("strategy_name")
+            "strategy_name": payload.get("strategy_name"),
+            "leg_index": payload.get("leg_index"),
+            "position": payload.get("position"),
+            "quantity": payload.get("quantity"),
+            "client": payload.get("client"),
+            "action": payload.get("action")
         }
         # Filtrer les valeurs None
         updates = {k: v for k, v in updates.items() if v is not None}
@@ -279,7 +291,12 @@ async def handle_create_alarm(websocket: WebSocket, user: User, payload: dict):
                 "condition": alarm.condition.value if hasattr(alarm.condition, 'value') else alarm.condition,
                 "active": alarm.active,
                 "strategy_id": alarm.strategy_id,
-                "strategy_name": alarm.strategy_name
+                "strategy_name": alarm.strategy_name,
+                "leg_index": alarm.leg_index,
+                "position": alarm.position,
+                "quantity": alarm.quantity,
+                "client": alarm.client,
+                "action": alarm.action
             }
         )
     else:
@@ -291,7 +308,12 @@ async def handle_create_alarm(websocket: WebSocket, user: User, payload: dict):
             option=payload.get("option"),
             condition=AlarmCondition(payload.get("condition")),
             strategy_id=strategy_id,
-            strategy_name=payload.get("strategy_name")
+            strategy_name=payload.get("strategy_name"),
+            leg_index=payload.get("leg_index"),
+            position=payload.get("position"),
+            quantity=payload.get("quantity"),
+            client=payload.get("client"),
+            action=payload.get("action")
         )
         
         alarm = await storage.create_alarm(alarm_data, user.id)
@@ -309,7 +331,12 @@ async def handle_create_alarm(websocket: WebSocket, user: User, payload: dict):
                 "condition": alarm.condition.value,
                 "active": alarm.active,
                 "strategy_id": alarm.strategy_id,
-                "strategy_name": alarm.strategy_name
+                "strategy_name": alarm.strategy_name,
+                "leg_index": alarm.leg_index,
+                "position": alarm.position,
+                "quantity": alarm.quantity,
+                "client": alarm.client,
+                "action": alarm.action
             }
         )
     
@@ -599,7 +626,12 @@ async def handle_share_page(websocket: WebSocket, user: User, payload: dict):
                     "active": a.active,
                     "last_triggered": a.last_triggered.isoformat() if a.last_triggered else None,
                     "strategy_id": a.strategy_id,
-                    "strategy_name": a.strategy_name
+                    "strategy_name": a.strategy_name,
+                    "leg_index": a.leg_index,
+                    "position": a.position,
+                    "quantity": a.quantity,
+                    "client": a.client,
+                    "action": a.action
                 }
                 for a in alarms
             ]

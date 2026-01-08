@@ -165,7 +165,12 @@ async def add_member_to_group(
                         "active": a.active,
                         "last_triggered": a.last_triggered.isoformat() if a.last_triggered else None,
                         "strategy_id": a.strategy_id,
-                        "strategy_name": a.strategy_name
+                        "strategy_name": a.strategy_name,
+                        "leg_index": a.leg_index,
+                        "position": a.position,
+                        "quantity": a.quantity,
+                        "client": a.client,
+                        "action": a.action
                     }
                     for a in alarms
                 ]

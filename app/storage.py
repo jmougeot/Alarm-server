@@ -112,6 +112,11 @@ async def init_db():
                 condition TEXT NOT NULL,
                 strategy_id TEXT,
                 strategy_name TEXT,
+                leg_index INTEGER,
+                position TEXT,
+                quantity INTEGER,
+                client TEXT,
+                action TEXT,
                 created_by TEXT NOT NULL,
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at DATETIME NOT NULL,
@@ -138,6 +143,22 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_alarms_page ON alarms(page_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_permissions_subject ON page_permissions(subject_type, subject_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_user_groups_user ON user_groups(user_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_alarms_strategy_leg ON alarms(strategy_id, page_id, leg_index)")
+        
+        # Migration: Ajouter les nouvelles colonnes si elles n'existent pas
+        # SQLite ne supporte pas IF NOT EXISTS pour ALTER TABLE, donc on utilise try/except
+        new_columns = [
+            ("leg_index", "INTEGER"),
+            ("position", "TEXT"),
+            ("quantity", "INTEGER"),
+            ("client", "TEXT"),
+            ("action", "TEXT")
+        ]
+        for col_name, col_type in new_columns:
+            try:
+                await db.execute(f"ALTER TABLE alarms ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass  # Colonne existe déjà
         
         await db.commit()
 
@@ -480,8 +501,9 @@ async def create_alarm(alarm: AlarmCreate, created_by: str) -> Alarm:
         await db.execute(
             """
             INSERT INTO alarms 
-            (id, page_id, ticker, option, condition, strategy_id, strategy_name, created_by, active, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            (id, page_id, ticker, option, condition, strategy_id, strategy_name, 
+             leg_index, position, quantity, client, action, created_by, active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             """,
             (
                 alarm_id,
@@ -491,6 +513,11 @@ async def create_alarm(alarm: AlarmCreate, created_by: str) -> Alarm:
                 alarm.condition.value,
                 alarm.strategy_id,
                 alarm.strategy_name,
+                alarm.leg_index,
+                alarm.position,
+                alarm.quantity,
+                alarm.client,
+                alarm.action,
                 created_by,
                 created_at
             )
@@ -505,6 +532,11 @@ async def create_alarm(alarm: AlarmCreate, created_by: str) -> Alarm:
         condition=alarm.condition,
         strategy_id=alarm.strategy_id,
         strategy_name=alarm.strategy_name,
+        leg_index=alarm.leg_index,
+        position=alarm.position,
+        quantity=alarm.quantity,
+        client=alarm.client,
+        action=alarm.action,
         created_by=created_by,
         active=True,
         created_at=created_at,
@@ -518,6 +550,7 @@ async def get_alarm_by_id(alarm_id: str) -> Optional[Alarm]:
         cursor = await db.execute(
             """
             SELECT id, page_id, ticker, option, condition, strategy_id, strategy_name,
+                   leg_index, position, quantity, client, action,
                    created_by, active, created_at, last_triggered
             FROM alarms WHERE id = ?
             """,
@@ -533,6 +566,11 @@ async def get_alarm_by_id(alarm_id: str) -> Optional[Alarm]:
                 condition=row["condition"],
                 strategy_id=row["strategy_id"],
                 strategy_name=row["strategy_name"],
+                leg_index=row["leg_index"],
+                position=row["position"],
+                quantity=row["quantity"],
+                client=row["client"],
+                action=row["action"],
                 created_by=row["created_by"],
                 active=bool(row["active"]),
                 created_at=row["created_at"],
@@ -556,6 +594,7 @@ async def get_alarm_by_strategy_id(strategy_id: str, page_id: str) -> Optional[A
         cursor = await db.execute(
             """
             SELECT id, page_id, ticker, option, condition, strategy_id, strategy_name,
+                   leg_index, position, quantity, client, action,
                    created_by, active, created_at, last_triggered
             FROM alarms WHERE strategy_id = ? AND page_id = ?
             """,
@@ -572,12 +611,70 @@ async def get_alarm_by_strategy_id(strategy_id: str, page_id: str) -> Optional[A
                 condition=row["condition"],
                 strategy_id=row["strategy_id"],
                 strategy_name=row["strategy_name"],
+                leg_index=row["leg_index"],
+                position=row["position"],
+                quantity=row["quantity"],
+                client=row["client"],
+                action=row["action"],
                 created_by=row["created_by"],
                 active=bool(row["active"]),
                 created_at=row["created_at"],
                 last_triggered=row["last_triggered"]
             )
         logger.debug(f"[get_alarm_by_strategy_id] NOT FOUND for strategy_id='{strategy_id}'")
+        return None
+
+
+async def get_alarm_by_strategy_and_leg(strategy_id: str, page_id: str, leg_index: int) -> Optional[Alarm]:
+    """
+    Récupère une alarme par son strategy_id, page_id et leg_index
+    Permet d'avoir plusieurs legs par stratégie
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    if not strategy_id:
+        return None
+    
+    # Si leg_index est None, on le traite comme 0
+    if leg_index is None:
+        leg_index = 0
+    
+    logger.debug(f"[get_alarm_by_strategy_and_leg] Looking for strategy_id='{strategy_id}', page_id='{page_id}', leg_index={leg_index}")
+    
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT id, page_id, ticker, option, condition, strategy_id, strategy_name,
+                   leg_index, position, quantity, client, action,
+                   created_by, active, created_at, last_triggered
+            FROM alarms 
+            WHERE strategy_id = ? AND page_id = ? AND (leg_index = ? OR (leg_index IS NULL AND ? = 0))
+            """,
+            (strategy_id, page_id, leg_index, leg_index)
+        )
+        row = await cursor.fetchone()
+        if row:
+            logger.debug(f"[get_alarm_by_strategy_and_leg] FOUND alarm id={row['id']}")
+            return Alarm(
+                id=row["id"],
+                page_id=row["page_id"],
+                ticker=row["ticker"],
+                option=row["option"],
+                condition=row["condition"],
+                strategy_id=row["strategy_id"],
+                strategy_name=row["strategy_name"],
+                leg_index=row["leg_index"],
+                position=row["position"],
+                quantity=row["quantity"],
+                client=row["client"],
+                action=row["action"],
+                created_by=row["created_by"],
+                active=bool(row["active"]),
+                created_at=row["created_at"],
+                last_triggered=row["last_triggered"]
+            )
+        logger.debug(f"[get_alarm_by_strategy_and_leg] NOT FOUND")
         return None
 
 
@@ -591,6 +688,7 @@ async def get_alarms_for_pages(page_ids: List[str]) -> List[Alarm]:
         cursor = await db.execute(
             f"""
             SELECT id, page_id, ticker, option, condition, strategy_id, strategy_name,
+                   leg_index, position, quantity, client, action,
                    created_by, active, created_at, last_triggered
             FROM alarms
             WHERE page_id IN ({placeholders})
@@ -608,6 +706,11 @@ async def get_alarms_for_pages(page_ids: List[str]) -> List[Alarm]:
                 condition=row["condition"],
                 strategy_id=row["strategy_id"],
                 strategy_name=row["strategy_name"],
+                leg_index=row["leg_index"],
+                position=row["position"],
+                quantity=row["quantity"],
+                client=row["client"],
+                action=row["action"],
                 created_by=row["created_by"],
                 active=bool(row["active"]),
                 created_at=row["created_at"],
@@ -619,7 +722,8 @@ async def get_alarms_for_pages(page_ids: List[str]) -> List[Alarm]:
 
 async def update_alarm(alarm_id: str, **kwargs) -> Optional[Alarm]:
     """Met à jour une alarme"""
-    allowed_fields = {"ticker", "option", "condition", "active", "strategy_id", "strategy_name"}
+    allowed_fields = {"ticker", "option", "condition", "active", "strategy_id", "strategy_name",
+                      "leg_index", "position", "quantity", "client", "action"}
     updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
     
     if not updates:
@@ -674,6 +778,7 @@ async def get_alarms_by_strategy_id(strategy_id: str) -> List[Alarm]:
         cursor = await db.execute(
             """
             SELECT id, page_id, ticker, option, condition, strategy_id, strategy_name,
+                   leg_index, position, quantity, client, action,
                    created_by, active, created_at, last_triggered
             FROM alarms WHERE strategy_id = ?
             """,
@@ -689,6 +794,11 @@ async def get_alarms_by_strategy_id(strategy_id: str) -> List[Alarm]:
                 condition=row["condition"],
                 strategy_id=row["strategy_id"],
                 strategy_name=row["strategy_name"],
+                leg_index=row["leg_index"],
+                position=row["position"],
+                quantity=row["quantity"],
+                client=row["client"],
+                action=row["action"],
                 created_by=row["created_by"],
                 active=bool(row["active"]),
                 created_at=row["created_at"],
