@@ -82,7 +82,7 @@ class PageBase(BaseModel):
 
 
 class PageCreate(PageBase):
-    pass
+    id: Optional[str] = None  # Client peut fournir son propre ID
 
 
 class Page(PageBase):

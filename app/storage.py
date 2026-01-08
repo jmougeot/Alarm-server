@@ -231,7 +231,8 @@ async def get_user_groups(user_id: str) -> List[str]:
 
 async def create_page(page: PageCreate, owner_id: str) -> Page:
     """Crée une nouvelle page et donne automatiquement les permissions au créateur"""
-    page_id = str(uuid.uuid4())
+    # Utiliser l'ID fourni par le client ou en générer un nouveau
+    page_id = page.id if page.id else str(uuid.uuid4())
     created_at = datetime.utcnow()
     
     async with get_db() as db:

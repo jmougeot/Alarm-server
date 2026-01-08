@@ -460,9 +460,10 @@ async def handle_create_page(websocket: WebSocket, user: User, payload: dict):
     from .models import PageCreate
     
     page_name = payload.get("name")
-    logger.debug(f"[CREATE_PAGE] User '{user.username}' - name='{page_name}'")
+    page_id = payload.get("id")  # ID optionnel fourni par le client
+    logger.debug(f"[CREATE_PAGE] User '{user.username}' - name='{page_name}', client_id={page_id}")
     
-    page_data = PageCreate(name=page_name)
+    page_data = PageCreate(name=page_name, id=page_id)
     page = await storage.create_page(page_data, user.id)
     logger.info(f"[CREATE_PAGE] SUCCESS - Created page id={page.id}, name='{page.name}'")
     
@@ -542,7 +543,7 @@ async def handle_share_page(websocket: WebSocket, user: User, payload: dict):
         subject_type=SubjectType(payload.get("subject_type")),
         subject_id=payload.get("subject_id"),
         can_view=payload.get("can_view", True),
-        can_edit=payload.get("can_edit", False)
+        can_edit=payload.get("can_edit", True)
     )
     
     await storage.set_page_permission(permission_data)
