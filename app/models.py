@@ -94,6 +94,22 @@ class Page(PageBase):
         from_attributes = True
 
 
+class PageEnriched(BaseModel):
+    """Page enrichie avec métadonnées pour le client"""
+    id: str
+    name: str
+    owner_id: str
+    owner_name: Optional[str] = None
+    is_owner: bool = False
+    group_id: Optional[str] = None
+    group_name: Optional[str] = None
+    shared_by: Optional[str] = None
+    can_edit: bool = False
+
+    class Config:
+        from_attributes = True
+
+
 # ─────────────────────────────────────────────────────────────
 # PAGE PERMISSIONS
 # ─────────────────────────────────────────────────────────────

@@ -75,13 +75,13 @@ class ConnectionManager:
     async def _send_initial_data(self, websocket: WebSocket, user: User):
         """
         Envoie les données initiales à la connexion :
-        - Pages accessibles
+        - Pages accessibles (enrichies avec métadonnées)
         - Alarmes de ces pages
         """
         try:
-            # Récupérer les pages accessibles
-            pages = await storage.get_accessible_pages(user.id)
-            page_ids = [p.id for p in pages]
+            # Récupérer les pages accessibles enrichies
+            pages = await storage.get_accessible_pages_enriched(user.id)
+            page_ids = [p["id"] for p in pages]
             
             # Récupérer les alarmes de ces pages
             alarms = await storage.get_alarms_for_pages(page_ids)
@@ -99,15 +99,7 @@ class ConnectionManager:
                     "id": user.id,
                     "username": user.username
                 },
-                "pages": [
-                    {
-                        "id": p.id,
-                        "name": p.name,
-                        "owner_id": p.owner_id,
-                        "is_owner": p.owner_id == user.id
-                    }
-                    for p in pages
-                ],
+                "pages": pages,  # Déjà enrichies avec toutes les métadonnées
                 "alarms": [
                     {
                         "id": a.id,
@@ -520,7 +512,12 @@ async def handle_create_page(websocket: WebSocket, user: User, payload: dict):
             "id": page.id,
             "name": page.name,
             "owner_id": page.owner_id,
-            "is_owner": True
+            "owner_name": user.username,
+            "is_owner": True,
+            "group_id": None,
+            "group_name": None,
+            "shared_by": None,
+            "can_edit": True
         }
     )
     await manager.send_to_user(user.id, page_update)
@@ -605,17 +602,35 @@ async def handle_share_page(websocket: WebSocket, user: User, payload: dict):
         }
     ))
     
+    # Récupérer les infos du groupe si partage avec un groupe
+    group_id = None
+    group_name = None
+    if permission_data.subject_type == SubjectType.GROUP:
+        group = await storage.get_group_by_id(permission_data.subject_id)
+        if group:
+            group_id = group.id
+            group_name = group.name
+    
     # Récupérer les alarmes de la page pour les envoyer aux nouveaux utilisateurs
     alarms = await storage.get_alarms_for_pages([page_id])
+    
+    # Construire le payload enrichi de la page
+    page_payload = {
+        "id": page.id,
+        "name": page.name,
+        "owner_id": page.owner_id,
+        "owner_name": user.username,
+        "is_owner": False,
+        "group_id": group_id,
+        "group_name": group_name,
+        "shared_by": user.username if permission_data.subject_type == SubjectType.USER else None,
+        "can_edit": permission_data.can_edit
+    }
+    
     page_shared_message = WSMessage(
         type="page_shared_with_you",
         payload={
-            "page": {
-                "id": page.id,
-                "name": page.name,
-                "owner_id": page.owner_id,
-                "is_owner": False
-            },
+            "page": page_payload,
             "alarms": [
                 {
                     "id": a.id,

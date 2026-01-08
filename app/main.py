@@ -138,12 +138,22 @@ async def add_member_to_group(
     if not success:
         raise HTTPException(status_code=400, detail="Could not add user to group")
     
+    # Récupérer les infos du groupe
+    group = await storage.get_group_by_id(group_id)
+    
     # Notifier le nouvel utilisateur des pages partagées avec ce groupe
     pages_shared = await storage.get_pages_shared_with_group(group_id)
     
     for page in pages_shared:
+        # Récupérer le nom du propriétaire
+        owner = await storage.get_user_by_id(page.owner_id)
+        owner_name = owner.username if owner else None
+        
         # Récupérer les alarmes de la page
         alarms = await storage.get_alarms_for_pages([page.id])
+        
+        # Récupérer les droits d'édition pour ce groupe
+        can_edit = await storage.get_group_permission_on_page(group_id, page.id)
         
         # Envoyer la page et ses alarmes au nouvel utilisateur du groupe
         await manager.send_to_user(user_id, WSMessage(
@@ -153,7 +163,12 @@ async def add_member_to_group(
                     "id": page.id,
                     "name": page.name,
                     "owner_id": page.owner_id,
-                    "is_owner": False
+                    "owner_name": owner_name,
+                    "is_owner": False,
+                    "group_id": group.id if group else None,
+                    "group_name": group.name if group else None,
+                    "shared_by": None,
+                    "can_edit": can_edit
                 },
                 "alarms": [
                     {
@@ -297,7 +312,12 @@ async def create_page(
             "id": page.id,
             "name": page.name,
             "owner_id": page.owner_id,
-            "is_owner": True
+            "owner_name": current_user.username,
+            "is_owner": True,
+            "group_id": None,
+            "group_name": None,
+            "shared_by": None,
+            "can_edit": True
         }
     )
     await manager.send_to_user(current_user.id, page_update)
@@ -305,23 +325,21 @@ async def create_page(
     return {
         "id": page.id,
         "name": page.name,
-        "owner_id": page.owner_id
+        "owner_id": page.owner_id,
+        "owner_name": current_user.username,
+        "is_owner": True,
+        "group_id": None,
+        "group_name": None,
+        "shared_by": None,
+        "can_edit": True
     }
 
 
 @app.get("/pages")
 async def list_pages(current_user: User = Depends(auth.get_current_user)):
-    """Liste les pages accessibles par l'utilisateur"""
-    pages = await storage.get_accessible_pages(current_user.id)
-    return [
-        {
-            "id": p.id,
-            "name": p.name,
-            "owner_id": p.owner_id,
-            "is_owner": p.owner_id == current_user.id
-        }
-        for p in pages
-    ]
+    """Liste les pages accessibles par l'utilisateur avec métadonnées enrichies"""
+    pages = await storage.get_accessible_pages_enriched(current_user.id)
+    return pages
 
 
 @app.delete("/pages/{page_id}")
@@ -412,17 +430,39 @@ async def add_page_permission(
     # Notifier les utilisateurs concernés par le nouveau partage
     from .models import WSMessage, SubjectType
     
+    # Récupérer les infos du groupe si partage avec un groupe
+    group_id = None
+    group_name = None
+    if permission_data.subject_type == SubjectType.GROUP:
+        group = await storage.get_group_by_id(permission_data.subject_id)
+        if group:
+            group_id = group.id
+            group_name = group.name
+    
+    # Récupérer le nom du propriétaire
+    owner = await storage.get_user_by_id(page.owner_id)
+    owner_name = owner.username if owner else None
+    
     # Récupérer les alarmes de la page
     alarms = await storage.get_alarms_for_pages([page_id])
+    
+    # Construire le payload enrichi de la page
+    page_payload = {
+        "id": page.id,
+        "name": page.name,
+        "owner_id": page.owner_id,
+        "owner_name": owner_name,
+        "is_owner": False,
+        "group_id": group_id,
+        "group_name": group_name,
+        "shared_by": owner_name if permission_data.subject_type == SubjectType.USER else None,
+        "can_edit": permission_data.can_edit
+    }
+    
     page_shared_message = WSMessage(
         type="page_shared_with_you",
         payload={
-            "page": {
-                "id": page.id,
-                "name": page.name,
-                "owner_id": page.owner_id,
-                "is_owner": False
-            },
+            "page": page_payload,
             "alarms": [
                 {
                     "id": a.id,

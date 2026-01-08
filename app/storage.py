@@ -349,6 +349,183 @@ async def get_accessible_pages(user_id: str) -> List[Page]:
         ]
 
 
+async def get_accessible_pages_enriched(user_id: str) -> List[dict]:
+    """
+    Récupère toutes les pages accessibles par un utilisateur avec métadonnées enrichies
+    Retourne: owner_name, is_owner, group_id, group_name, shared_by, can_edit
+    """
+    group_ids = await get_user_groups(user_id)
+    
+    async with get_db() as db:
+        # Requête enrichie avec toutes les métadonnées
+        query = """
+            SELECT DISTINCT 
+                p.id, 
+                p.name, 
+                p.owner_id, 
+                p.created_at,
+                owner.username as owner_name,
+                pp.subject_type,
+                pp.subject_id,
+                pp.can_edit,
+                g.id as group_id,
+                g.name as group_name
+            FROM pages p
+            LEFT JOIN users owner ON p.owner_id = owner.id
+            LEFT JOIN page_permissions pp ON p.id = pp.page_id
+            LEFT JOIN groups g ON (pp.subject_type = 'group' AND pp.subject_id = g.id)
+            WHERE 
+                p.owner_id = ?
+                OR (pp.subject_type = 'user' AND pp.subject_id = ? AND pp.can_view = 1)
+        """
+        params = [user_id, user_id]
+        
+        # Ajouter condition groupes si l'user a des groupes
+        if group_ids:
+            placeholders = ",".join("?" * len(group_ids))
+            query += f" OR (pp.subject_type = 'group' AND pp.subject_id IN ({placeholders}) AND pp.can_view = 1)"
+            params.extend(group_ids)
+        
+        cursor = await db.execute(query, params)
+        rows = await cursor.fetchall()
+        
+        # Construire les pages enrichies
+        pages_dict = {}
+        for row in rows:
+            page_id = row["id"]
+            is_owner = row["owner_id"] == user_id
+            
+            # Déterminer can_edit : owner a toujours edit, sinon vérifier permission
+            can_edit = is_owner or (row["can_edit"] == 1 if row["can_edit"] is not None else False)
+            
+            # Déterminer les métadonnées de partage
+            shared_by = None
+            group_id = None
+            group_name = None
+            
+            if not is_owner and row["subject_type"] == "group":
+                group_id = row["group_id"]
+                group_name = row["group_name"]
+            elif not is_owner and row["subject_type"] == "user":
+                # Partagé directement avec l'utilisateur, le propriétaire est celui qui a partagé
+                shared_by = row["owner_name"]
+            
+            # Éviter les doublons (une page peut apparaître plusieurs fois si partagée via plusieurs groupes)
+            if page_id not in pages_dict:
+                pages_dict[page_id] = {
+                    "id": page_id,
+                    "name": row["name"],
+                    "owner_id": row["owner_id"],
+                    "owner_name": row["owner_name"],
+                    "is_owner": is_owner,
+                    "group_id": group_id,
+                    "group_name": group_name,
+                    "shared_by": shared_by,
+                    "can_edit": can_edit
+                }
+            else:
+                # Mettre à jour can_edit si une autre permission donne l'accès
+                if can_edit:
+                    pages_dict[page_id]["can_edit"] = True
+                # Si partagé via groupe, prioriser l'info du groupe
+                if group_id and not pages_dict[page_id]["group_id"]:
+                    pages_dict[page_id]["group_id"] = group_id
+                    pages_dict[page_id]["group_name"] = group_name
+        
+        return list(pages_dict.values())
+
+
+async def get_page_enriched(page_id: str, user_id: str) -> Optional[dict]:
+    """
+    Récupère une page enrichie avec métadonnées pour un utilisateur
+    """
+    async with get_db() as db:
+        # Récupérer la page avec le nom du propriétaire
+        cursor = await db.execute(
+            """
+            SELECT p.id, p.name, p.owner_id, p.created_at, u.username as owner_name
+            FROM pages p
+            LEFT JOIN users u ON p.owner_id = u.id
+            WHERE p.id = ?
+            """,
+            (page_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        
+        is_owner = row["owner_id"] == user_id
+        
+        # Si owner, pas besoin de chercher les permissions
+        if is_owner:
+            return {
+                "id": row["id"],
+                "name": row["name"],
+                "owner_id": row["owner_id"],
+                "owner_name": row["owner_name"],
+                "is_owner": True,
+                "group_id": None,
+                "group_name": None,
+                "shared_by": None,
+                "can_edit": True
+            }
+        
+        # Chercher comment l'utilisateur a accès (permission directe ou via groupe)
+        group_ids = await get_user_groups(user_id)
+        
+        # Vérifier permission directe
+        cursor = await db.execute(
+            """
+            SELECT can_edit FROM page_permissions
+            WHERE page_id = ? AND subject_type = 'user' AND subject_id = ?
+            """,
+            (page_id, user_id)
+        )
+        direct_perm = await cursor.fetchone()
+        
+        if direct_perm:
+            return {
+                "id": row["id"],
+                "name": row["name"],
+                "owner_id": row["owner_id"],
+                "owner_name": row["owner_name"],
+                "is_owner": False,
+                "group_id": None,
+                "group_name": None,
+                "shared_by": row["owner_name"],
+                "can_edit": direct_perm["can_edit"] == 1
+            }
+        
+        # Vérifier permission via groupe
+        if group_ids:
+            placeholders = ",".join("?" * len(group_ids))
+            cursor = await db.execute(
+                f"""
+                SELECT pp.can_edit, g.id as group_id, g.name as group_name
+                FROM page_permissions pp
+                JOIN groups g ON pp.subject_id = g.id
+                WHERE pp.page_id = ? AND pp.subject_type = 'group' AND pp.subject_id IN ({placeholders})
+                """,
+                [page_id] + group_ids
+            )
+            group_perm = await cursor.fetchone()
+            
+            if group_perm:
+                return {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "owner_id": row["owner_id"],
+                    "owner_name": row["owner_name"],
+                    "is_owner": False,
+                    "group_id": group_perm["group_id"],
+                    "group_name": group_perm["group_name"],
+                    "shared_by": None,
+                    "can_edit": group_perm["can_edit"] == 1
+                }
+        
+        return None
+
+
 async def can_user_view_page(user_id: str, page_id: str) -> bool:
     """Vérifie si un utilisateur peut voir une page"""
     page = await get_page_by_id(page_id)
@@ -1057,3 +1234,20 @@ async def get_pages_shared_with_group(group_id: str) -> List[Page]:
             )
             for row in rows
         ]
+
+
+async def get_group_permission_on_page(group_id: str, page_id: str) -> bool:
+    """
+    Récupère les droits d'édition d'un groupe sur une page
+    Retourne True si le groupe peut éditer, False sinon
+    """
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT can_edit FROM page_permissions
+            WHERE page_id = ? AND subject_type = 'group' AND subject_id = ?
+            """,
+            (page_id, group_id)
+        )
+        row = await cursor.fetchone()
+        return row["can_edit"] == 1 if row else False
